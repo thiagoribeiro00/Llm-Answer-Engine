@@ -8,26 +8,13 @@ import { MemoryVectorStore } from 'langchain/vectorstores/memory';
 import { Document as DocumentInterface } from 'langchain/document';
 import { OpenAIEmbeddings } from '@langchain/openai';
 import { OllamaEmbeddings } from "@langchain/community/embeddings/ollama";
+// 1.5 Configuration file for inference model, embeddings model, and other parameters
 import { config } from './config';
-import { functionCalling } from './function-calling';
-// OPTIONAL: Use Upstash rate limiting to limit the number of requests per user
-import { Ratelimit } from "@upstash/ratelimit";
-import { Redis } from "@upstash/redis";
-import { headers } from 'next/headers'
-let ratelimit: Ratelimit | undefined;
-if (config.useRateLimiting) {
-  ratelimit = new Ratelimit({
-    redis: Redis.fromEnv(),
-    limiter: Ratelimit.slidingWindow(10, "10 m") // 10 requests per 10 minutes
-  });
-}
-// import searchProviders from './tools/searchProviders';
-import { braveSearch, googleSearch, serperSearch } from './tools/searchProviders';
 // 2. Determine which embeddings mode and which inference model to use based on the config.tsx. Currently suppport for OpenAI, Groq and partial support for Ollama embeddings and inference
 let openai: OpenAI;
 if (config.useOllamaInference) {
   openai = new OpenAI({
-    baseURL: 'http://localhost:11434/v1',
+    baseURL: config.ollamaBaseUrl,
     apiKey: 'ollama'
   });
 } else {
@@ -41,7 +28,8 @@ let embeddings: OllamaEmbeddings | OpenAIEmbeddings;
 if (config.useOllamaEmbeddings) {
   embeddings = new OllamaEmbeddings({
     model: config.embeddingsModel,
-    baseUrl: "http://localhost:11434"
+    // baseUrl: "http://localhost:11434"
+    baseUrl: "http://localhost:8080"
   });
 } else {
   embeddings = new OpenAIEmbeddings({
@@ -52,13 +40,14 @@ if (config.useOllamaEmbeddings) {
 interface SearchResult {
   title: string;
   link: string;
+  snippet: string;
   favicon: string;
 }
 interface ContentResult extends SearchResult {
   html: string;
 }
 // 4. Fetch search results from Brave Search API
-export async function getSources(message: string, numberOfPagesToScan = config.numberOfPagesToScan): Promise<SearchResult[]> {
+async function getSources(message: string, numberOfPagesToScan = config.numberOfPagesToScan): Promise<SearchResult[]> {
   try {
     const response = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(message)}&count=${numberOfPagesToScan}`, {
       headers: {
@@ -77,6 +66,7 @@ export async function getSources(message: string, numberOfPagesToScan = config.n
     const final = jsonResponse.web.results.map((result: any): SearchResult => ({
       title: result.title,
       link: result.url,
+      snippet: result.description,
       favicon: result.profile.img
     }));
     return final;
@@ -86,7 +76,7 @@ export async function getSources(message: string, numberOfPagesToScan = config.n
   }
 }
 // 5. Fetch contents of top 10 search results
-export async function get10BlueLinksContents(sources: SearchResult[]): Promise<ContentResult[]> {
+async function get10BlueLinksContents(sources: SearchResult[]): Promise<ContentResult[]> {
   async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = 800): Promise<Response> {
     try {
       const controller = new AbortController();
@@ -134,14 +124,13 @@ export async function get10BlueLinksContents(sources: SearchResult[]): Promise<C
   }
 }
 // 6. Process and vectorize content using LangChain
-export async function processAndVectorizeContent(
+async function processAndVectorizeContent(
   contents: ContentResult[],
   query: string,
   textChunkSize = config.textChunkSize,
   textChunkOverlap = config.textChunkOverlap,
   numberOfSimilarityResults = config.numberOfSimilarityResults,
 ): Promise<DocumentInterface[]> {
-  const allResults: DocumentInterface[] = [];
   try {
     for (let i = 0; i < contents.length; i++) {
       const content = contents[i];
@@ -149,42 +138,36 @@ export async function processAndVectorizeContent(
         try {
           const splitText = await new RecursiveCharacterTextSplitter({ chunkSize: textChunkSize, chunkOverlap: textChunkOverlap }).splitText(content.html);
           const vectorStore = await MemoryVectorStore.fromTexts(splitText, { title: content.title, link: content.link }, embeddings);
-          const contentResults = await vectorStore.similaritySearch(query, numberOfSimilarityResults);
-          allResults.push(...contentResults);
+          return await vectorStore.similaritySearch(query, numberOfSimilarityResults);
         } catch (error) {
           console.error(`Error processing content for ${content.link}:`, error);
         }
       }
     }
-    return allResults;
+    return [];
   } catch (error) {
     console.error('Error processing and vectorizing content:', error);
     throw error;
   }
 }
-// 7. Fetch image search results from Serper API
-export async function getImages(message: string): Promise<{ title: string; link: string }[]> {
-  const url = 'https://google.serper.dev/images';
-  const data = JSON.stringify({
-    "q": message
-  });
-  const requestOptions: RequestInit = {
-    method: 'POST',
-    headers: {
-      'X-API-KEY': process.env.SERPER_API as string,
-      'Content-Type': 'application/json'
-    },
-    body: data
-  };
+// 7. Fetch image search results from Brave Search API
+async function getImages(message: string): Promise<{ title: string; link: string }[]> {
   try {
-    const response = await fetch(url, requestOptions);
+    const response = await fetch(`https://api.search.brave.com/res/v1/images/search?q=${message}&spellcheck=1`, {
+      method: "GET",
+      headers: {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": process.env.BRAVE_SEARCH_API_KEY as string
+      }
+    });
     if (!response.ok) {
       throw new Error(`Network response was not ok. Status: ${response.status}`);
     }
-    const responseData = await response.json();
+    const data = await response.json();
     const validLinks = await Promise.all(
-      responseData.images.map(async (image: any) => {
-        const link = image.imageUrl;
+      data.results.map(async (result: any) => {
+        const link = result.properties.url;
         if (typeof link === 'string') {
           try {
             const imageResponse = await fetch(link, { method: 'HEAD' });
@@ -192,7 +175,7 @@ export async function getImages(message: string): Promise<{ title: string; link:
               const contentType = imageResponse.headers.get('content-type');
               if (contentType && contentType.startsWith('image/')) {
                 return {
-                  title: image.title,
+                  title: result.properties.title,
                   link: link,
                 };
               }
@@ -207,12 +190,12 @@ export async function getImages(message: string): Promise<{ title: string; link:
     const filteredLinks = validLinks.filter((link): link is { title: string; link: string } => link !== null);
     return filteredLinks.slice(0, 9);
   } catch (error) {
-    console.error('Error fetching images:', error);
+    console.error('There was a problem with your fetch operation:', error);
     throw error;
   }
 }
-// 8. Fetch video search results from  Serper API
-export async function getVideos(message: string): Promise<{ imageUrl: string, link: string }[] | null> {
+// 8. Fetch video search results from Google Serper API
+async function getVideos(message: string): Promise<{ imageUrl: string, link: string }[] | null> {
   const url = 'https://google.serper.dev/videos';
   const data = JSON.stringify({
     "q": message
@@ -258,7 +241,7 @@ export async function getVideos(message: string): Promise<{ imageUrl: string, li
   }
 }
 // 9. Generate follow-up questions using OpenAI API
-const relevantQuestions = async (sources: SearchResult[], userMessage: String): Promise<any> => {
+const relevantQuestions = async (sources: SearchResult[]): Promise<any> => {
   return await openai.chat.completions.create({
     messages: [
       {
@@ -278,7 +261,7 @@ const relevantQuestions = async (sources: SearchResult[], userMessage: String): 
       },
       {
         role: "user",
-        content: `Generate follow-up questions based on the top results from a similarity search: ${JSON.stringify(sources)}. The original search query is: "${userMessage}".`,
+        content: `Generate follow-up questions based on the top results from a similarity search: ${JSON.stringify(sources)}. The original search query is: "The original search query".`,
       },
     ],
     model: config.inferenceModel,
@@ -290,37 +273,23 @@ async function myAction(userMessage: string): Promise<any> {
   "use server";
   const streamable = createStreamableValue({});
   (async () => {
-    if (config.useRateLimiting && ratelimit) {
-      const identifier = headers().get('x-forwarded-for') || headers().get('x-real-ip') || headers().get('cf-connecting-ip') || headers().get('client-ip') || "";
-      const { success } = await ratelimit.limit(identifier)
-      if (!success) {
-        return streamable.done({ 'status': 'rateLimitReached' });
-      }
-    }
-    const [images, sources, videos, condtionalFunctionCallUI] = await Promise.all([
+    const [images, sources, videos] = await Promise.all([
       getImages(userMessage),
-      config.searchProvider === "brave" ? braveSearch(userMessage) :
-        config.searchProvider === "serper" ? serperSearch(userMessage) :
-          config.searchProvider === "google" ? googleSearch(userMessage) :
-            Promise.reject(new Error(`Unsupported search provider: ${config.searchProvider}`)),
+      getSources(userMessage),
       getVideos(userMessage),
-      functionCalling(userMessage),
     ]);
     streamable.update({ 'searchResults': sources });
     streamable.update({ 'images': images });
     streamable.update({ 'videos': videos });
-    if (config.useFunctionCalling) {
-      streamable.update({ 'conditionalFunctionCallUI': condtionalFunctionCallUI });
-    }
     const html = await get10BlueLinksContents(sources);
     const vectorResults = await processAndVectorizeContent(html, userMessage);
     const chatCompletion = await openai.chat.completions.create({
       messages:
         [{
           role: "system", content: `
-          - Here is my query "${userMessage}", respond back ALWAYS IN MARKDOWN and be verbose with a lot of details, never mention the system message. If you can't find any relevant results, respond with "No relevant results found." `
+          - Here is my query "${userMessage}", You are an AI sales and marketing specialist and only return answers related to sales, act as a sales and business development representative only" `
         },
-        { role: "user", content: ` - Here are the top results to respond with, respond in markdown!:,  ${JSON.stringify(vectorResults)}. ` },
+        { role: "user", content: ` - Here are the top results from a similarity search: ${JSON.stringify(vectorResults)}. ` },
         ], stream: true, model: config.inferenceModel
     });
     for await (const chunk of chatCompletion) {
@@ -331,7 +300,7 @@ async function myAction(userMessage: string): Promise<any> {
       }
     }
     if (!config.useOllamaInference) {
-      const followUp = await relevantQuestions(sources, userMessage);
+      const followUp = await relevantQuestions(sources);
       streamable.update({ 'followUp': followUp });
     }
     streamable.done({ status: 'done' });

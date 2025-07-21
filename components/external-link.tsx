@@ -13,7 +13,7 @@ export function ExternalLink({
     >
       <span>{children}</span>
       <svg
-        aria-hidden="true"
+        aria-hidden="false"
         height="7"
         viewBox="0 0 6 6"
         width="7"

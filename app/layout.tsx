@@ -10,15 +10,15 @@ import { Header } from '@/components/header';
 import { Providers } from '@/components/providers';
 
 const meta = {
-  title: 'answers, how they should be displayed.',
+  title: 'answer engine',
   description:
     'anwser engine built by developers digest',
 };
 export const metadata: Metadata = {
   ...meta,
   title: {
-    default: 'answer website',
-    template: `%s - answer website`,
+    default: 'answer engine',
+    template: `%s - answer engine`,
   },
   icons: {
     icon: '/favicon.ico',
@@ -51,7 +51,6 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
       <body
         className={`font-sans antialiased ${GeistSans.variable} ${GeistMono.variable}`}
       >
